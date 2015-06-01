@@ -4,22 +4,19 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
-	"path"
+	"path/filepath"
 	"regexp"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
 	"github.com/docker/machine/drivers"
+	"github.com/docker/machine/log"
 	"github.com/docker/machine/ssh"
 	"github.com/docker/machine/state"
 )
 
 const (
-	dockerConfigDir  = "/etc/docker"
-	ApiEndpoint      = "https://api.softlayer.com/rest/v3"
-	DockerInstallUrl = "https://get.docker.com"
+	ApiEndpoint = "https://api.softlayer.com/rest/v3"
 )
 
 type Driver struct {
@@ -28,9 +25,15 @@ type Driver struct {
 	deviceConfig   *deviceConfig
 	Id             int
 	Client         *Client
+	SSHUser        string
+	SSHPort        int
 	MachineName    string
 	CaCertPath     string
 	PrivateKeyPath string
+	SSHKeyID       int
+	SwarmMaster    bool
+	SwarmHost      string
+	SwarmDiscovery string
 }
 
 type deviceConfig struct {
@@ -42,9 +45,10 @@ type deviceConfig struct {
 	Memory        int
 	Image         string
 	HourlyBilling bool
-	InstallScript string
 	LocalDisk     bool
 	PrivateNet    bool
+	PublicVLAN    int
+	PrivateVLAN   int
 }
 
 func init() {
@@ -56,6 +60,42 @@ func init() {
 
 func NewDriver(machineName string, storePath string, caCert string, privateKey string) (drivers.Driver, error) {
 	return &Driver{MachineName: machineName, storePath: storePath, CaCertPath: caCert, PrivateKeyPath: privateKey}, nil
+}
+
+func (d *Driver) AuthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) DeauthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) GetMachineName() string {
+	return d.MachineName
+}
+
+func (d *Driver) GetSSHHostname() (string, error) {
+	return d.GetIP()
+}
+
+func (d *Driver) GetSSHKeyPath() string {
+	return filepath.Join(d.storePath, "id_rsa")
+}
+
+func (d *Driver) GetSSHPort() (int, error) {
+	if d.SSHPort == 0 {
+		d.SSHPort = 22
+	}
+
+	return d.SSHPort, nil
+}
+
+func (d *Driver) GetSSHUsername() string {
+	if d.SSHUser == "" {
+		d.SSHUser = "root"
+	}
+
+	return d.SSHUser
 }
 
 func GetCreateFlags() []cli.Flag {
@@ -103,8 +143,8 @@ func GetCreateFlags() []cli.Flag {
 		cli.StringFlag{
 			EnvVar: "SOFTLAYER_HOSTNAME",
 			Name:   "softlayer-hostname",
-			Usage:  "hostname for the machine",
-			Value:  "docker",
+			Usage:  "hostname for the machine - defaults to machine name",
+			Value:  "",
 		},
 		cli.StringFlag{
 			EnvVar: "SOFTLAYER_DOMAIN",
@@ -139,19 +179,22 @@ func GetCreateFlags() []cli.Flag {
 			Usage:  "OS image for machine",
 			Value:  "UBUNTU_LATEST",
 		},
-		cli.StringFlag{
-			EnvVar: "SOFTLAYER_INSTALL_SCRIPT",
-			Name:   "softlayer-install-script",
-			Usage:  "Install script to call after the machine is initialized (should install Docker)",
-			Value:  DockerInstallUrl,
+		cli.IntFlag{
+			EnvVar: "SOFTLAYER_PUBLIC_VLAN_ID",
+			Name:   "softlayer-public-vlan-id",
+			Usage:  "",
+			Value:  0,
+		},
+		cli.IntFlag{
+			EnvVar: "SOFTLAYER_PRIVATE_VLAN_ID",
+			Name:   "softlayer-private-vlan-id",
+			Usage:  "",
+			Value:  0,
 		},
 	}
 }
 
 func validateDeviceConfig(c *deviceConfig) error {
-	if c.Hostname == "" {
-		return fmt.Errorf("Missing required setting - --softlayer-hostname")
-	}
 	if c.Domain == "" {
 		return fmt.Errorf("Missing required setting - --softlayer-domain")
 	}
@@ -161,6 +204,16 @@ func validateDeviceConfig(c *deviceConfig) error {
 	}
 	if c.Cpu < 1 {
 		return fmt.Errorf("Missing required setting - --softlayer-cpu")
+	}
+
+	if c.PrivateNet && c.PublicVLAN > 0 {
+		return fmt.Errorf("Can not specify both --softlayer-private-net-only and --softlayer-public-vlan-id")
+	}
+	if c.PublicVLAN > 0 && c.PrivateVLAN == 0 {
+		return fmt.Errorf("Missing required setting - --softlayer-private-vlan-id (because --softlayer-public-vlan-id is specified)")
+	}
+	if c.PrivateVLAN > 0 && !c.PrivateNet && c.PublicVLAN == 0 {
+		return fmt.Errorf("Missing required setting - --softlayer-public-vlan-id (because --softlayer-private-vlan-id is specified)")
 	}
 
 	return nil
@@ -190,6 +243,12 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		ApiKey:   flags.String("softlayer-api-key"),
 	}
 
+	d.SwarmMaster = flags.Bool("swarm-master")
+	d.SwarmHost = flags.String("swarm-host")
+	d.SwarmDiscovery = flags.String("swarm-discovery")
+	d.SSHUser = "root"
+	d.SSHPort = 22
+
 	if err := validateClientConfig(d.Client); err != nil {
 		return err
 	}
@@ -203,10 +262,16 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		PrivateNet:    flags.Bool("softlayer-private-net-only"),
 		LocalDisk:     flags.Bool("softlayer-local-disk"),
 		HourlyBilling: flags.Bool("softlayer-hourly-billing"),
-		InstallScript: flags.String("softlayer-install-script"),
-		Image:         "UBUNTU_LATEST",
+		Image:         flags.String("softlayer-image"),
 		Region:        flags.String("softlayer-region"),
+		PublicVLAN:    flags.Int("softlayer-public-vlan-id"),
+		PrivateVLAN:   flags.Int("softlayer-private-vlan-id"),
 	}
+
+	if d.deviceConfig.Hostname == "" {
+		d.deviceConfig.Hostname = d.GetMachineName()
+	}
+
 	return validateDeviceConfig(d.deviceConfig)
 }
 
@@ -216,38 +281,6 @@ func (d *Driver) getClient() *Client {
 
 func (d *Driver) DriverName() string {
 	return "softlayer"
-}
-
-func (d *Driver) StartDocker() error {
-	log.Debug("Starting Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker start")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) StopDocker() error {
-	log.Debug("Stopping Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker stop")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) GetDockerConfigDir() string {
-	return dockerConfigDir
 }
 
 func (d *Driver) GetURL() (string, error) {
@@ -265,7 +298,11 @@ func (d *Driver) GetIP() (string, error) {
 	if d.IPAddress != "" {
 		return d.IPAddress, nil
 	}
-	return d.getClient().VirtualGuest().GetPublicIp(d.Id)
+	if d.deviceConfig != nil && d.deviceConfig.PrivateNet == true {
+		return d.getClient().VirtualGuest().GetPrivateIp(d.Id)
+	} else {
+		return d.getClient().VirtualGuest().GetPublicIp(d.Id)
+	}
 }
 
 func (d *Driver) GetState() (state.State, error) {
@@ -285,55 +322,91 @@ func (d *Driver) GetState() (state.State, error) {
 	return vmState, nil
 }
 
-func (d *Driver) GetSSHCommand(args ...string) (*exec.Cmd, error) {
-	return ssh.GetSSHCommand(d.IPAddress, 22, "root", d.sshKeyPath(), args...), nil
+func (d *Driver) GetActiveTransaction() (string, error) {
+	t, err := d.getClient().VirtualGuest().ActiveTransaction(d.Id)
+	if err != nil {
+		return "", err
+	}
+	return t, nil
 }
 
 func (d *Driver) PreCreateCheck() error {
 	return nil
 }
 
+func (d *Driver) waitForStart() {
+	log.Infof("Waiting for host to become available")
+	for {
+		s, err := d.GetState()
+		if err != nil {
+			log.Debugf("Failed to GetState - %+v", err)
+			continue
+		}
+
+		if s == state.Running {
+			break
+		} else {
+			log.Debugf("Still waiting - state is %s...", s)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (d *Driver) getIp() (string, error) {
+	log.Infof("Getting Host IP")
+	for {
+		var (
+			ip  string
+			err error
+		)
+		if d.deviceConfig.PrivateNet {
+			ip, err = d.getClient().VirtualGuest().GetPrivateIp(d.Id)
+		} else {
+			ip, err = d.getClient().VirtualGuest().GetPublicIp(d.Id)
+		}
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		// not a perfect regex, but should be just fine for our needs
+		exp := regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`)
+		if exp.MatchString(ip) {
+			d.IPAddress = ip
+			return ip, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (d *Driver) waitForSetupTransactions() {
+	log.Infof("Waiting for host setup transactions to complete")
+	// sometimes we'll hit a case where there's no active transaction, but if
+	// we check again in a few seconds, it moves to the next transaction. We
+	// don't want to get false-positives, so we check a few times in a row to make sure!
+	noActiveCount, maxNoActiveCount := 0, 3
+	for {
+		t, err := d.GetActiveTransaction()
+		if err != nil {
+			noActiveCount = 0
+			log.Debugf("Failed to GetActiveTransaction - %+v", err)
+			continue
+		}
+
+		if t == "" {
+			if noActiveCount == maxNoActiveCount {
+				break
+			}
+			noActiveCount++
+		} else {
+			noActiveCount = 0
+			log.Debugf("Still waiting - active transaction is %s...", t)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 func (d *Driver) Create() error {
-	waitForStart := func() {
-		log.Infof("Waiting for host to become available")
-		for {
-			s, err := d.GetState()
-			if err != nil {
-				continue
-			}
-
-			if s == state.Running {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	getIp := func() {
-		log.Infof("Getting Host IP")
-		for {
-			var (
-				ip  string
-				err error
-			)
-			if d.deviceConfig.PrivateNet {
-				ip, err = d.getClient().VirtualGuest().GetPrivateIp(d.Id)
-			} else {
-				ip, err = d.getClient().VirtualGuest().GetPublicIp(d.Id)
-			}
-			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			// not a perfect regex, but should be just fine for our needs
-			exp := regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`)
-			if exp.MatchString(ip) {
-				d.IPAddress = ip
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-	}
+	spec := d.buildHostSpec()
 
 	log.Infof("Creating SSH key...")
 	key, err := d.createSSHKey()
@@ -341,7 +414,9 @@ func (d *Driver) Create() error {
 		return err
 	}
 
-	spec := d.buildHostSpec()
+	log.Infof("SSH key %s (%d) created in SoftLayer", key.Label, key.Id)
+	d.SSHKeyID = key.Id
+
 	spec.SshKeys = []*SshKey{key}
 
 	id, err := d.getClient().VirtualGuest().Create(spec)
@@ -349,12 +424,10 @@ func (d *Driver) Create() error {
 		return fmt.Errorf("Error creating host: %q", err)
 	}
 	d.Id = id
-	getIp()
-	waitForStart()
-	ssh.WaitForTCP(d.IPAddress + ":22")
-	if err := d.setupHost(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up host config: %q", err)
-	}
+	d.getIp()
+	d.waitForStart()
+	d.waitForSetupTransactions()
+
 	return nil
 }
 
@@ -365,19 +438,34 @@ func (d *Driver) buildHostSpec() *HostSpec {
 		Cpu:            d.deviceConfig.Cpu,
 		Memory:         d.deviceConfig.Memory,
 		Datacenter:     Datacenter{Name: d.deviceConfig.Region},
-		InstallScript:  d.deviceConfig.InstallScript,
 		Os:             d.deviceConfig.Image,
 		HourlyBilling:  d.deviceConfig.HourlyBilling,
 		PrivateNetOnly: d.deviceConfig.PrivateNet,
+		LocalDisk:      d.deviceConfig.LocalDisk,
 	}
 	if d.deviceConfig.DiskSize > 0 {
 		spec.BlockDevices = []BlockDevice{{Device: "0", DiskImage: DiskImage{Capacity: d.deviceConfig.DiskSize}}}
 	}
+	if d.deviceConfig.PublicVLAN > 0 {
+		spec.PrimaryNetworkComponent = &NetworkComponent{
+			NetworkVLAN: &NetworkVLAN{
+				Id: d.deviceConfig.PublicVLAN,
+			},
+		}
+	}
+	if d.deviceConfig.PrivateVLAN > 0 {
+		spec.PrimaryBackendNetworkComponent = &NetworkComponent{
+			NetworkVLAN: &NetworkVLAN{
+				Id: d.deviceConfig.PrivateVLAN,
+			},
+		}
+	}
+	log.Debugf("Built host spec %#v", spec)
 	return spec
 }
 
 func (d *Driver) createSSHKey() (*SshKey, error) {
-	if err := ssh.GenerateSSHKey(d.sshKeyPath()); err != nil {
+	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return nil, err
 	}
 
@@ -395,17 +483,15 @@ func (d *Driver) createSSHKey() (*SshKey, error) {
 }
 
 func (d *Driver) publicSSHKeyPath() string {
-	return d.sshKeyPath() + ".pub"
-}
-
-func (d *Driver) sshKeyPath() string {
-	return path.Join(d.storePath, "id_rsa")
+	return d.GetSSHKeyPath() + ".pub"
 }
 
 func (d *Driver) Kill() error {
 	return d.getClient().VirtualGuest().PowerOff(d.Id)
 }
+
 func (d *Driver) Remove() error {
+	log.Infof("Canceling SoftLayer instance %d...", d.Id)
 	var err error
 	for i := 0; i < 5; i++ {
 		if err = d.getClient().VirtualGuest().Cancel(d.Id); err != nil {
@@ -414,7 +500,16 @@ func (d *Driver) Remove() error {
 		}
 		break
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	log.Infof("Removing SSH Key %d...", d.SSHKeyID)
+	if err = d.getClient().SshKey().Delete(d.SSHKeyID); err != nil {
+		return err
+	}
+
+	return nil
 }
 func (d *Driver) Restart() error {
 	return d.getClient().VirtualGuest().Reboot(d.Id)
@@ -424,38 +519,4 @@ func (d *Driver) Start() error {
 }
 func (d *Driver) Stop() error {
 	return d.getClient().VirtualGuest().PowerOff(d.Id)
-}
-
-func (d *Driver) Upgrade() error {
-	log.Debugf("Upgrading Docker")
-
-	cmd, err := d.GetSSHCommand("sudo apt-get update && apt-get install --upgrade lxc-docker")
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
-	}
-
-	return cmd.Run()
-}
-
-func (d *Driver) setupHost() error {
-	log.Infof("Configuring host OS")
-	ssh.WaitForTCP(d.IPAddress + ":22")
-	// Wait to make sure docker is installed
-	for {
-		cmd, err := d.GetSSHCommand(`[ -f "$(which docker)" ] && [ -f "/etc/default/docker" ] || exit 1`)
-		if err != nil {
-			return err
-		}
-		if err := cmd.Run(); err == nil {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	return nil
 }

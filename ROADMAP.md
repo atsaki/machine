@@ -1,22 +1,26 @@
-# Roadmap
+# Machine Roadmap
 
+Machine currently works really well for development and test environments. The
+goal is to make it work better for provisioning and managing production
+environments.
 
-## Machine 1.0
+This is not a simple task -- production is inherently far more complex than
+development -- but there are three things which are big steps towards that goal:
+**client/server architecture**, **swarm integration** and **flexible
+provisioning**.
 
-This will be a stable version of the current design with additional drivers and complete documentation.
+(Note: this document is a high-level overview of where we are taking Machine.
+For what is coming in specific releases, see our [upcoming
+milestones](https://github.com/docker/machine/milestones).)
 
-You can follow progress towards this release with the [GitHub milestone](https://github.com/docker/machine/milestones/1.0).
+### Docker Engine / Swarm Configuration
+Currently there are only a few things that can be configured in the Docker Engine and Swarm.  This will enable more operations such as Engine labels and Swarm strategies.
 
-## Future
+### Boot2Docker Migration Support
+Currently both Machine and Boot2Docker provider similar functionality.  This will enable users to migrate from boot2docker to machine.
 
-There are two main areas for future development:
+### Expand Provisioner
+Machine currently supports running Boot2Docker for "local" providers and Ubuntu for "remote" providers.  This will expand the provisioning capabilities to include other base operating systems such as Red Hat-like distributions and possibly other "just enough" operating systems.
 
- - **Machine server:** Machine currently relies on storing configuration locally on the computer that the command-line client is run which makes it difficult to use in teams and for large deployments.
-   
-   Machines should instead be managed by a central server with a REST API. The command-line client would be a client for this server. To keep the current behaviour, and to manage local VMs, the server could run in an embedded mode inside the client.
-
- - **Swarm integration:** Machine should be able to create and manage [Swarm](https://github.com/docker/swarm) clusters. Perhaps it's even the default. Imagine this:
-
-        $ docker-machine create -d digitalocean production
-        $ docker-machine scale production=100
-
+### Windows Experience
+Currently, the Machine on Windows experience is not as good as the Mac / Linux.  There is no "recommended" path to use Machine and there are several inconsistencies on Windows such as logging and output formatting.

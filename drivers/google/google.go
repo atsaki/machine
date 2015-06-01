@@ -2,42 +2,34 @@ package google
 
 import (
 	"fmt"
+	"path/filepath"
 
-	"github.com/docker/machine/state"
-
-	"os/exec"
-	"path"
-
-	log "github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
 	"github.com/docker/machine/drivers"
+	"github.com/docker/machine/log"
 	"github.com/docker/machine/ssh"
-)
-
-const (
-	dockerConfigDir = "/etc/docker"
+	"github.com/docker/machine/state"
 )
 
 // Driver is a struct compatible with the docker.hosts.drivers.Driver interface.
 type Driver struct {
-	MachineName      string
-	Zone             string
-	MachineType      string
-	storePath        string
-	UserName         string
-	Project          string
-	CaCertPath       string
-	PrivateKeyPath   string
-	sshKeyPath       string
-	publicSSHKeyPath string
-}
-
-// CreateFlags are the command line flags used to create a driver.
-type CreateFlags struct {
-	Zone        *string
-	MachineType *string
-	UserName    *string
-	Project     *string
+	IPAddress      string
+	MachineName    string
+	SSHUser        string
+	SSHPort        int
+	Zone           string
+	MachineType    string
+	DiskType       string
+	Scopes         string
+	DiskSize       int
+	AuthTokenPath  string
+	storePath      string
+	Project        string
+	CaCertPath     string
+	PrivateKeyPath string
+	SwarmMaster    bool
+	SwarmHost      string
+	SwarmDiscovery string
 }
 
 func init() {
@@ -74,40 +66,105 @@ func GetCreateFlags() []cli.Flag {
 			Usage:  "GCE Project",
 			EnvVar: "GOOGLE_PROJECT",
 		},
+		cli.StringFlag{
+			Name:   "google-auth-token",
+			Usage:  "GCE oAuth token",
+			EnvVar: "GOOGLE_AUTH_TOKEN",
+		},
+		cli.StringFlag{
+			Name:   "google-scopes",
+			Usage:  "GCE Scopes (comma-separated if multiple scopes)",
+			Value:  "https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write",
+			EnvVar: "GOOGLE_SCOPES",
+		},
+		cli.IntFlag{
+			Name:   "google-disk-size",
+			Usage:  "GCE Instance Disk Size (in GB)",
+			Value:  10,
+			EnvVar: "GOOGLE_DISK_SIZE",
+		},
+		cli.StringFlag{
+			Name:   "google-disk-type",
+			Usage:  "GCE Instance Disk type",
+			Value:  "pd-standard",
+			EnvVar: "GOOGLE_DISK_TYPE",
+		},
 	}
 }
 
 // NewDriver creates a Driver with the specified storePath.
 func NewDriver(machineName string, storePath string, caCert string, privateKey string) (drivers.Driver, error) {
 	return &Driver{
-		MachineName:      machineName,
-		storePath:        storePath,
-		CaCertPath:       caCert,
-		PrivateKeyPath:   privateKey,
-		sshKeyPath:       path.Join(storePath, "id_rsa"),
-		publicSSHKeyPath: path.Join(storePath, "id_rsa.pub"),
+		MachineName:    machineName,
+		storePath:      storePath,
+		CaCertPath:     caCert,
+		PrivateKeyPath: privateKey,
 	}, nil
 }
 
+func (d *Driver) AuthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) DeauthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) GetMachineName() string {
+	return d.MachineName
+}
+
+func (d *Driver) GetSSHHostname() (string, error) {
+	return d.GetIP()
+}
+
+func (d *Driver) GetSSHKeyPath() string {
+	return filepath.Join(d.storePath, "id_rsa")
+}
+
+func (d *Driver) GetSSHPort() (int, error) {
+	if d.SSHPort == 0 {
+		d.SSHPort = 22
+	}
+
+	return d.SSHPort, nil
+}
+
+func (d *Driver) GetSSHUsername() string {
+	if d.SSHUser == "" {
+		d.SSHUser = "docker-user"
+	}
+
+	return d.SSHUser
+}
+
 // DriverName returns the name of the driver.
-func (driver *Driver) DriverName() string {
+func (d *Driver) DriverName() string {
 	return "google"
 }
 
 // SetConfigFromFlags initializes the driver based on the command line flags.
-func (driver *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	driver.Zone = flags.String("google-zone")
-	driver.MachineType = flags.String("google-machine-type")
-	driver.UserName = flags.String("google-username")
-	driver.Project = flags.String("google-project")
-	if driver.Project == "" {
+func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
+	d.Zone = flags.String("google-zone")
+	d.MachineType = flags.String("google-machine-type")
+	d.DiskSize = flags.Int("google-disk-size")
+	d.DiskType = flags.String("google-disk-type")
+	d.AuthTokenPath = flags.String("google-auth-token")
+	d.Project = flags.String("google-project")
+	d.Scopes = flags.String("google-scopes")
+	d.SwarmMaster = flags.Bool("swarm-master")
+	d.SwarmHost = flags.String("swarm-host")
+	d.SwarmDiscovery = flags.String("swarm-discovery")
+	if d.Project == "" {
 		return fmt.Errorf("Please specify the Google Cloud Project name using the option --google-project.")
 	}
+	d.SSHUser = flags.String("google-username")
+	d.SSHPort = 22
 	return nil
 }
 
-func (driver *Driver) initApis() (*ComputeUtil, error) {
-	return newComputeUtil(driver)
+func (d *Driver) initApis() (*ComputeUtil, error) {
+	return newComputeUtil(d)
 }
 
 func (d *Driver) PreCreateCheck() error {
@@ -115,8 +172,8 @@ func (d *Driver) PreCreateCheck() error {
 }
 
 // Create creates a GCE VM instance acting as a docker host.
-func (driver *Driver) Create() error {
-	c, err := newComputeUtil(driver)
+func (d *Driver) Create() error {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return err
 	}
@@ -124,20 +181,20 @@ func (driver *Driver) Create() error {
 	// Check if the instance already exists. There will be an error if the instance
 	// doesn't exist, so just check instance for nil.
 	if instance, _ := c.instance(); instance != nil {
-		return fmt.Errorf("Instance %v already exists.", driver.MachineName)
+		return fmt.Errorf("Instance %v already exists.", d.MachineName)
 	}
 
 	log.Infof("Generating SSH Key")
-	if err := ssh.GenerateSSHKey(driver.sshKeyPath); err != nil {
+	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
 	}
 
-	return c.createInstance(driver)
+	return c.createInstance(d)
 }
 
 // GetURL returns the URL of the remote docker daemon.
-func (driver *Driver) GetURL() (string, error) {
-	ip, err := driver.GetIP()
+func (d *Driver) GetURL() (string, error) {
+	ip, err := d.GetIP()
 	if err != nil {
 		return "", err
 	}
@@ -146,8 +203,8 @@ func (driver *Driver) GetURL() (string, error) {
 }
 
 // GetIP returns the IP address of the GCE instance.
-func (driver *Driver) GetIP() (string, error) {
-	c, err := newComputeUtil(driver)
+func (d *Driver) GetIP() (string, error) {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return "", err
 	}
@@ -155,8 +212,8 @@ func (driver *Driver) GetIP() (string, error) {
 }
 
 // GetState returns a docker.hosts.state.State value representing the current state of the host.
-func (driver *Driver) GetState() (state.State, error) {
-	c, err := newComputeUtil(driver)
+func (d *Driver) GetState() (state.State, error) {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return state.None, err
 	}
@@ -184,30 +241,38 @@ func (driver *Driver) GetState() (state.State, error) {
 }
 
 // Start creates a GCE instance and attaches it to the existing disk.
-func (driver *Driver) Start() error {
-	c, err := newComputeUtil(driver)
+func (d *Driver) Start() error {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return err
 	}
-	return c.createInstance(driver)
+	if err = c.createInstance(d); err != nil {
+		return err
+	}
+	d.IPAddress, err = d.GetIP()
+	return err
 }
 
 // Stop deletes the GCE instance, but keeps the disk.
-func (driver *Driver) Stop() error {
-	c, err := newComputeUtil(driver)
+func (d *Driver) Stop() error {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return err
 	}
-	return c.deleteInstance()
+	if err = c.deleteInstance(); err != nil {
+		return err
+	}
+	d.IPAddress = ""
+	return nil
 }
 
 // Remove deletes the GCE instance and the disk.
-func (driver *Driver) Remove() error {
-	c, err := newComputeUtil(driver)
+func (d *Driver) Remove() error {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return err
 	}
-	s, err := driver.GetState()
+	s, err := d.GetState()
 	if err != nil {
 		return err
 	}
@@ -220,8 +285,8 @@ func (driver *Driver) Remove() error {
 }
 
 // Restart deletes and recreates the GCE instance, keeping the disk.
-func (driver *Driver) Restart() error {
-	c, err := newComputeUtil(driver)
+func (d *Driver) Restart() error {
+	c, err := newComputeUtil(d)
 	if err != nil {
 		return err
 	}
@@ -229,60 +294,10 @@ func (driver *Driver) Restart() error {
 		return err
 	}
 
-	return c.createInstance(driver)
+	return c.createInstance(d)
 }
 
 // Kill deletes the GCE instance, but keeps the disk.
-func (driver *Driver) Kill() error {
-	return driver.Stop()
-}
-
-func (d *Driver) StartDocker() error {
-	log.Debug("Starting Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker start")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) StopDocker() error {
-	log.Debug("Stopping Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker stop")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) GetDockerConfigDir() string {
-	return dockerConfigDir
-}
-
-// GetSSHCommand returns a command that will run over SSH on the GCE instance.
-func (driver *Driver) GetSSHCommand(args ...string) (*exec.Cmd, error) {
-	ip, err := driver.GetIP()
-	if err != nil {
-		return nil, err
-	}
-	return ssh.GetSSHCommand(ip, 22, driver.UserName, driver.sshKeyPath, args...), nil
-}
-
-// Upgrade upgrades the docker daemon on the host to the latest version.
-func (driver *Driver) Upgrade() error {
-	c, err := newComputeUtil(driver)
-	if err != nil {
-		return err
-	}
-	return c.updateDocker(driver)
+func (d *Driver) Kill() error {
+	return d.Stop()
 }

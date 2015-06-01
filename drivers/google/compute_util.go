@@ -3,29 +3,34 @@ package google
 import (
 	"fmt"
 	"io/ioutil"
+	"net/url"
+	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/docker/machine/log"
 	"github.com/docker/machine/ssh"
 	raw "google.golang.org/api/compute/v1"
 )
 
 // ComputeUtil is used to wrap the raw GCE API code and store common parameters.
 type ComputeUtil struct {
-	zone         string
-	instanceName string
-	userName     string
-	project      string
-	service      *raw.Service
-	zoneURL      string
-	globalURL    string
-	ipAddress    string
+	zone          string
+	instanceName  string
+	userName      string
+	project       string
+	diskTypeURL   string
+	service       *raw.Service
+	zoneURL       string
+	authTokenPath string
+	globalURL     string
+	ipAddress     string
+	SwarmMaster   bool
+	SwarmHost     string
 }
 
 const (
-	apiURL = "https://www.googleapis.com/compute/v1/projects/"
-	//imageName          = "https://www.googleapis.com/compute/v1/projects/google-containers/global/images/container-vm-v20141016"
-	imageName          = "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-1404-trusty-v20141212"
+	apiURL             = "https://www.googleapis.com/compute/v1/projects/"
+	imageName          = "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-1404-trusty-v20150316"
 	firewallRule       = "docker-machines"
 	port               = "2376"
 	firewallTargetTag  = "docker-machine"
@@ -33,28 +38,34 @@ const (
 	dockerStopCommand  = "sudo service docker stop"
 )
 
-const ()
-
 // NewComputeUtil creates and initializes a ComputeUtil.
 func newComputeUtil(driver *Driver) (*ComputeUtil, error) {
-	service, err := newGCEService(driver.storePath)
+	service, err := newGCEService(driver.storePath, driver.AuthTokenPath)
 	if err != nil {
 		return nil, err
 	}
 	c := ComputeUtil{
-		zone:         driver.Zone,
-		instanceName: driver.MachineName,
-		userName:     driver.UserName,
-		project:      driver.Project,
-		service:      service,
-		zoneURL:      apiURL + driver.Project + "/zones/" + driver.Zone,
-		globalURL:    apiURL + driver.Project + "/global",
+		authTokenPath: driver.AuthTokenPath,
+		zone:          driver.Zone,
+		instanceName:  driver.MachineName,
+		userName:      driver.SSHUser,
+		project:       driver.Project,
+		diskTypeURL:   driver.DiskType,
+		service:       service,
+		zoneURL:       apiURL + driver.Project + "/zones/" + driver.Zone,
+		globalURL:     apiURL + driver.Project + "/global",
+		SwarmMaster:   driver.SwarmMaster,
+		SwarmHost:     driver.SwarmHost,
 	}
 	return &c, nil
 }
 
 func (c *ComputeUtil) diskName() string {
 	return c.instanceName + "-disk"
+}
+
+func (c *ComputeUtil) diskType() string {
+	return apiURL + c.project + "/zones/" + c.zone + "/diskTypes/" + c.diskTypeURL
 }
 
 // disk returns the gce Disk.
@@ -79,15 +90,33 @@ func (c *ComputeUtil) firewallRule() (*raw.Firewall, error) {
 
 func (c *ComputeUtil) createFirewallRule() error {
 	log.Infof("Creating firewall rule.")
-	rule := &raw.Firewall{
-		Allowed: []*raw.FirewallAllowed{
-			{
-				IPProtocol: "tcp",
-				Ports: []string{
-					port,
-				},
+	allowed := []*raw.FirewallAllowed{
+
+		{
+			IPProtocol: "tcp",
+			Ports: []string{
+				port,
 			},
 		},
+	}
+
+	if c.SwarmMaster {
+		u, err := url.Parse(c.SwarmHost)
+		if err != nil {
+			return fmt.Errorf("error authorizing port for swarm: %s", err)
+		}
+
+		parts := strings.Split(u.Host, ":")
+		swarmPort := parts[1]
+		allowed = append(allowed, &raw.FirewallAllowed{
+			IPProtocol: "tcp",
+			Ports: []string{
+				swarmPort,
+			},
+		})
+	}
+	rule := &raw.Firewall{
+		Allowed: allowed,
 		SourceRanges: []string{
 			"0.0.0.0/0",
 		},
@@ -143,12 +172,21 @@ func (c *ComputeUtil) createInstance(d *Driver) error {
 				firewallTargetTag,
 			},
 		},
+		ServiceAccounts: []*raw.ServiceAccount{
+			{
+				Email:  "default",
+				Scopes: strings.Split(d.Scopes, ","),
+			},
+		},
 	}
 	disk, err := c.disk()
 	if disk == nil || err != nil {
 		instance.Disks[0].InitializeParams = &raw.AttachedDiskInitializeParams{
 			DiskName:    c.diskName(),
 			SourceImage: imageName,
+			// The maximum supported disk size is 1000GB, the cast should be fine.
+			DiskSizeGb: int64(d.DiskSize),
+			DiskType:   c.diskType(),
 		}
 	} else {
 		instance.Disks[0].Source = c.zoneURL + "/disks/" + c.instanceName + "-disk"
@@ -158,6 +196,7 @@ func (c *ComputeUtil) createInstance(d *Driver) error {
 	if err != nil {
 		return err
 	}
+
 	log.Infof("Waiting for Instance...")
 	if err = c.waitForRegionalOp(op.Name); err != nil {
 		return err
@@ -167,11 +206,9 @@ func (c *ComputeUtil) createInstance(d *Driver) error {
 	if err != nil {
 		return err
 	}
-	ip := instance.NetworkInterfaces[0].AccessConfigs[0].NatIP
-	c.waitForSSH(ip)
 
 	// Update the SSH Key
-	sshKey, err := ioutil.ReadFile(d.publicSSHKeyPath)
+	sshKey, err := ioutil.ReadFile(d.GetSSHKeyPath() + ".pub")
 	if err != nil {
 		return err
 	}
@@ -194,49 +231,6 @@ func (c *ComputeUtil) createInstance(d *Driver) error {
 		return err
 	}
 
-	log.Debugf("Setting hostname: %s", d.MachineName)
-	cmd, err := d.GetSSHCommand(fmt.Sprintf(
-		"echo \"127.0.0.1 %s\" | sudo tee -a /etc/hosts && sudo hostname %s && echo \"%s\" | sudo tee /etc/hostname",
-		d.MachineName,
-		d.MachineName,
-		d.MachineName,
-	))
-
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	log.Debugf("Installing Docker")
-
-	cmd, err = d.GetSSHCommand("if [ ! -e /usr/bin/docker ]; then curl -sL https://get.docker.com | sudo sh -; fi")
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
-	}
-
-	return nil
-}
-
-func (c *ComputeUtil) updateDocker(d *Driver) error {
-	log.Debugf("Upgrading Docker")
-
-	cmd, err := d.GetSSHCommand("sudo apt-get update && apt-get install --upgrade lxc-docker")
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
-	}
-
 	return nil
 }
 
@@ -253,9 +247,17 @@ func (c *ComputeUtil) deleteInstance() error {
 
 func (c *ComputeUtil) executeCommands(commands []string, ip, sshKeyPath string) error {
 	for _, command := range commands {
-		cmd := ssh.GetSSHCommand(ip, 22, c.userName, sshKeyPath, command)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("error executing command: %v %v", command, err)
+		auth := &ssh.Auth{
+			Keys: []string{sshKeyPath},
+		}
+
+		client, err := ssh.NewClient(c.userName, ip, 22, auth)
+		if err != nil {
+			return err
+		}
+
+		if _, err := client.Output(command); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -290,12 +292,6 @@ func (c *ComputeUtil) waitForGlobalOp(name string) error {
 	return c.waitForOp(func() (*raw.Operation, error) {
 		return c.service.GlobalOperations.Get(c.project, name).Do()
 	})
-}
-
-// waitForSSH waits for SSH to become ready on the instance.
-func (c *ComputeUtil) waitForSSH(ip string) error {
-	log.Infof("Waiting for SSH...")
-	return ssh.WaitForTCP(fmt.Sprintf("%s:22", ip))
 }
 
 // ip retrieves and returns the external IP address of the instance.

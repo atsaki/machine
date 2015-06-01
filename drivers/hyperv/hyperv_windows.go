@@ -6,23 +6,21 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
 	"github.com/docker/machine/drivers"
+	"github.com/docker/machine/log"
 	"github.com/docker/machine/ssh"
 	"github.com/docker/machine/state"
 	"github.com/docker/machine/utils"
 )
 
-const (
-	dockerConfigDir = "/var/lib/boot2docker"
-)
-
 type Driver struct {
+	IPAddress      string
+	SSHUser        string
+	SSHPort        int
 	storePath      string
 	boot2DockerURL string
 	boot2DockerLoc string
@@ -33,6 +31,9 @@ type Driver struct {
 	memSize        int
 	CaCertPath     string
 	PrivateKeyPath string
+	SwarmMaster    bool
+	SwarmHost      string
+	SwarmDiscovery string
 }
 
 func init() {
@@ -77,11 +78,52 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.vSwitch = flags.String("hyper-v-virtual-switch")
 	d.diskSize = flags.Int("hyper-v-disk-size")
 	d.memSize = flags.Int("hyper-v-memory")
+	d.SwarmMaster = flags.Bool("swarm-master")
+	d.SwarmHost = flags.String("swarm-host")
+	d.SwarmDiscovery = flags.String("swarm-discovery")
+	d.SSHUser = "docker"
+	d.SSHPort = 22
 	return nil
 }
 
 func NewDriver(machineName string, storePath string, caCert string, privateKey string) (drivers.Driver, error) {
 	return &Driver{MachineName: machineName, storePath: storePath, CaCertPath: caCert, PrivateKeyPath: privateKey}, nil
+}
+
+func (d *Driver) AuthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) DeauthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) GetMachineName() string {
+	return d.MachineName
+}
+
+func (d *Driver) GetSSHHostname() (string, error) {
+	return d.GetIP()
+}
+
+func (d *Driver) GetSSHKeyPath() string {
+	return filepath.Join(d.storePath, "id_rsa")
+}
+
+func (d *Driver) GetSSHPort() (int, error) {
+	if d.SSHPort == 0 {
+		d.SSHPort = 22
+	}
+
+	return d.SSHPort, nil
+}
+
+func (d *Driver) GetSSHUsername() string {
+	if d.SSHUser == "" {
+		d.SSHUser = "docker"
+	}
+
+	return d.SSHUser
 }
 
 func (d *Driver) DriverName() string {
@@ -189,7 +231,7 @@ func (d *Driver) Create() error {
 
 	log.Infof("Creating SSH key...")
 
-	if err := ssh.GenerateSSHKey(d.sshKeyPath()); err != nil {
+	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
 	}
 
@@ -247,21 +289,6 @@ func (d *Driver) Create() error {
 		return err
 	}
 
-	log.Infof("Setting hostname...")
-	cmd, err := d.GetSSHCommand(fmt.Sprintf(
-		"sudo hostname %s && echo \"%s\" | sudo tee /var/lib/boot2docker/etc/hostname",
-		d.MachineName,
-		d.MachineName,
-	))
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
-	}
-
 	return nil
 }
 
@@ -292,12 +319,7 @@ func (d *Driver) wait() error {
 		}
 		time.Sleep(1 * time.Second)
 	}
-	log.Infof("Got IP, waiting for SSH")
-	ip, err := d.GetIP()
-	if err != nil {
-		return err
-	}
-	return ssh.WaitForTCP(fmt.Sprintf("%s:22", ip))
+	return nil
 }
 
 func (d *Driver) Start() error {
@@ -308,7 +330,13 @@ func (d *Driver) Start() error {
 	if err != nil {
 		return err
 	}
-	return d.wait()
+
+	if err := d.wait(); err != nil {
+		return err
+	}
+
+	d.IPAddress, err = d.GetIP()
+	return err
 }
 
 func (d *Driver) Stop() error {
@@ -330,6 +358,7 @@ func (d *Driver) Stop() error {
 			break
 		}
 	}
+	d.IPAddress = ""
 	return nil
 }
 
@@ -380,6 +409,7 @@ func (d *Driver) Kill() error {
 			break
 		}
 	}
+	d.IPAddress = ""
 	return nil
 }
 
@@ -406,77 +436,8 @@ func (d *Driver) GetIP() (string, error) {
 	return resp[0], nil
 }
 
-func (d *Driver) GetSSHCommand(args ...string) (*exec.Cmd, error) {
-	ip, err := d.GetIP()
-	if err != nil {
-		return nil, err
-	}
-	return ssh.GetSSHCommand(ip, 22, "docker", d.sshKeyPath(), args...), nil
-}
-
-func (d *Driver) Upgrade() error {
-	log.Infof("Stopping machine...")
-	if err := d.Stop(); err != nil {
-		return err
-	}
-
-	b2dutils := utils.NewB2dUtils("", "")
-	isoURL, err := b2dutils.GetLatestBoot2DockerReleaseURL()
-	if err != nil {
-		return err
-	}
-
-	log.Infof("Downloading boot2docker...")
-	if err := b2dutils.DownloadISO(d.storePath, "boot2docker.iso", isoURL); err != nil {
-		return err
-	}
-
-	log.Infof("Starting machine...")
-	if err := d.Start(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) StartDocker() error {
-	log.Debug("Starting Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo /etc/init.d/docker start")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) StopDocker() error {
-	log.Debug("Stopping Docker...")
-
-	cmd, err := d.GetSSHCommand("if [ -e /var/run/docker.pid ]; then sudo /etc/init.d/docker stop ; fi")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) GetDockerConfigDir() string {
-	return dockerConfigDir
-}
-
-func (d *Driver) sshKeyPath() string {
-	return filepath.Join(d.storePath, "id_rsa")
-}
-
 func (d *Driver) publicSSHKeyPath() string {
-	return d.sshKeyPath() + ".pub"
+	return d.GetSSHKeyPath() + ".pub"
 }
 
 func (d *Driver) generateDiskImage() error {

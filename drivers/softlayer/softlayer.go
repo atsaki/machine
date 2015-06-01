@@ -16,18 +16,28 @@ type Client struct {
 }
 
 type HostSpec struct {
-	Hostname       string        `json:"hostname"`
-	Domain         string        `json:"domain"`
-	Cpu            int           `json:"startCpus"`
-	Memory         int           `json:"maxMemory"`
-	Datacenter     Datacenter    `json:"datacenter"`
-	SshKeys        []*SshKey     `json:"sshKeys"`
-	BlockDevices   []BlockDevice `json:"blockDevices"`
-	InstallScript  string        `json:"postInstallScriptUri"`
-	PrivateNetOnly bool          `json:"privateNetworkOnlyFlag"`
-	Os             string        `json:"operatingSystemReferenceCode"`
-	HourlyBilling  bool          `json:"hourlyBillingFlag"`
-	LocalDisk      bool          `json:"localDiskFlag"`
+	Hostname                       string            `json:"hostname"`
+	Domain                         string            `json:"domain"`
+	Cpu                            int               `json:"startCpus"`
+	Memory                         int               `json:"maxMemory"`
+	Datacenter                     Datacenter        `json:"datacenter"`
+	SshKeys                        []*SshKey         `json:"sshKeys"`
+	BlockDevices                   []BlockDevice     `json:"blockDevices"`
+	InstallScript                  string            `json:"postInstallScriptUri"`
+	PrivateNetOnly                 bool              `json:"privateNetworkOnlyFlag"`
+	Os                             string            `json:"operatingSystemReferenceCode"`
+	HourlyBilling                  bool              `json:"hourlyBillingFlag"`
+	LocalDisk                      bool              `json:"localDiskFlag"`
+	PrimaryNetworkComponent        *NetworkComponent `json:"primaryNetworkComponent,omitempty"`
+	PrimaryBackendNetworkComponent *NetworkComponent `json:"primaryBackendNetworkComponent,omitempty"`
+}
+
+type NetworkComponent struct {
+	NetworkVLAN *NetworkVLAN `json:"networkVlan"`
+}
+
+type NetworkVLAN struct {
+	Id int `json:"id"`
 }
 
 type SshKey struct {
@@ -150,6 +160,19 @@ func (c *sshKey) Create(label, key string) (*SshKey, error) {
 	return &k, nil
 }
 
+func (c *sshKey) Delete(id int) error {
+	var (
+		method = "DELETE"
+		uri    = fmt.Sprintf("%s/%v", c.namespace(), id)
+	)
+
+	_, err := c.newRequest(method, uri, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) VirtualGuest() *virtualGuest {
 	return &virtualGuest{c}
 }
@@ -178,6 +201,39 @@ func (c *virtualGuest) PowerState(id int) (string, error) {
 	}
 
 	return s.Name, nil
+}
+
+func (c *virtualGuest) ActiveTransaction(id int) (string, error) {
+	type transactionStatus struct {
+		AverageDuration string `json:"averageDuration"`
+		FriendlyName    string `json:"friendlyName"`
+		Name            string `json:"name"`
+	}
+	type transaction struct {
+		CreateDate        string            `json:"createDate"`
+		ElapsedSeconds    int               `json:"elapsedSeconds"`
+		GuestID           int               `json:"guestId"`
+		HardwareID        int               `json:"hardwareId"`
+		ID                int               `json:"id"`
+		ModifyDate        string            `json:"modifyDate"`
+		StatusChangeDate  string            `json:"statusChangeDate"`
+		TransactionStatus transactionStatus `json:"transactionStatus"`
+	}
+	var (
+		method = "GET"
+		uri    = fmt.Sprintf("%s/%v/getActiveTransaction.json", c.namespace(), id)
+	)
+
+	data, err := c.newRequest(method, uri, nil)
+	if err != nil {
+		return "", err
+	}
+	var t transaction
+	if err := json.Unmarshal(data, &t); err != nil {
+		return "", err
+	}
+
+	return t.TransactionStatus.Name, nil
 }
 
 func (c *virtualGuest) Create(spec *HostSpec) (int, error) {

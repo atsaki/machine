@@ -2,10 +2,9 @@ package none
 
 import (
 	"fmt"
-	"os/exec"
+	neturl "net/url"
 
 	"github.com/codegangsta/cli"
-	"github.com/docker/docker/api"
 	"github.com/docker/machine/drivers"
 	"github.com/docker/machine/state"
 )
@@ -14,7 +13,8 @@ import (
 // connect to existing Docker hosts by specifying the URL of the host as
 // an option.
 type Driver struct {
-	URL string
+	IPAddress string
+	URL       string
 }
 
 func init() {
@@ -38,38 +38,7 @@ func NewDriver(machineName string, storePath string, caCert string, privateKey s
 	return &Driver{}, nil
 }
 
-func (d *Driver) DriverName() string {
-	return "none"
-}
-
-func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	url := flags.String("url")
-
-	if url == "" {
-		return fmt.Errorf("--url option is required when no driver is selected")
-	}
-	validatedUrl, err := api.ValidateHost(url)
-	if err != nil {
-		return err
-	}
-
-	d.URL = validatedUrl
-	return nil
-}
-
-func (d *Driver) GetURL() (string, error) {
-	return d.URL, nil
-}
-
-func (d *Driver) GetIP() (string, error) {
-	return "", nil
-}
-
-func (d *Driver) GetState() (state.State, error) {
-	return state.None, nil
-}
-
-func (d *Driver) PreCreateCheck() error {
+func (d *Driver) AuthorizePort(ports []*drivers.Port) error {
 	return nil
 }
 
@@ -77,12 +46,52 @@ func (d *Driver) Create() error {
 	return nil
 }
 
-func (d *Driver) Start() error {
-	return fmt.Errorf("hosts without a driver cannot be started")
+func (d *Driver) DeauthorizePort(ports []*drivers.Port) error {
+	return nil
 }
 
-func (d *Driver) Stop() error {
-	return fmt.Errorf("hosts without a driver cannot be stopped")
+func (d *Driver) DriverName() string {
+	return "none"
+}
+
+func (d *Driver) GetIP() (string, error) {
+	return d.IPAddress, nil
+}
+
+func (d *Driver) GetMachineName() string {
+	return ""
+}
+
+func (d *Driver) GetSSHHostname() (string, error) {
+	return "", nil
+}
+
+func (d *Driver) GetSSHKeyPath() string {
+	return ""
+}
+
+func (d *Driver) GetSSHPort() (int, error) {
+	return 0, nil
+}
+
+func (d *Driver) GetSSHUsername() string {
+	return ""
+}
+
+func (d *Driver) GetURL() (string, error) {
+	return d.URL, nil
+}
+
+func (d *Driver) GetState() (state.State, error) {
+	return state.None, nil
+}
+
+func (d *Driver) Kill() error {
+	return fmt.Errorf("hosts without a driver cannot be killed")
+}
+
+func (d *Driver) PreCreateCheck() error {
+	return nil
 }
 
 func (d *Driver) Remove() error {
@@ -93,26 +102,27 @@ func (d *Driver) Restart() error {
 	return fmt.Errorf("hosts without a driver cannot be restarted")
 }
 
-func (d *Driver) Kill() error {
-	return fmt.Errorf("hosts without a driver cannot be killed")
+func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
+	url := flags.String("url")
+
+	if url == "" {
+		return fmt.Errorf("--url option is required when no driver is selected")
+	}
+
+	d.URL = url
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return err
+	}
+
+	d.IPAddress = u.Host
+	return nil
 }
 
-func (d *Driver) StartDocker() error {
-	return fmt.Errorf("hosts without a driver cannot start docker")
+func (d *Driver) Start() error {
+	return fmt.Errorf("hosts without a driver cannot be started")
 }
 
-func (d *Driver) StopDocker() error {
-	return fmt.Errorf("hosts without a driver cannot stop docker")
-}
-
-func (d *Driver) GetDockerConfigDir() string {
-	return ""
-}
-
-func (d *Driver) Upgrade() error {
-	return fmt.Errorf("hosts without a driver cannot be upgraded")
-}
-
-func (d *Driver) GetSSHCommand(args ...string) (*exec.Cmd, error) {
-	return nil, fmt.Errorf("hosts without a driver do not support SSH")
+func (d *Driver) Stop() error {
+	return fmt.Errorf("hosts without a driver cannot be stopped")
 }

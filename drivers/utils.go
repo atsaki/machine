@@ -2,41 +2,75 @@ package drivers
 
 import (
 	"fmt"
-	"os"
-	"path"
-	"path/filepath"
 
+	"github.com/docker/machine/log"
+	"github.com/docker/machine/ssh"
 	"github.com/docker/machine/utils"
 )
 
-func PublicKeyPath() string {
-	return filepath.Join(utils.GetDockerDir(), "public-key.json")
+func GetSSHClientFromDriver(d Driver) (ssh.Client, error) {
+	addr, err := d.GetSSHHostname()
+	if err != nil {
+		return nil, err
+	}
+
+	port, err := d.GetSSHPort()
+	if err != nil {
+		return nil, err
+	}
+
+	auth := &ssh.Auth{
+		Keys: []string{d.GetSSHKeyPath()},
+	}
+
+	client, err := ssh.NewClient(d.GetSSHUsername(), addr, port, auth)
+	return client, err
+
 }
 
-func AddPublicKeyToAuthorizedHosts(d Driver, authorizedKeysPath string) error {
-	f, err := os.Open(PublicKeyPath())
+func RunSSHCommandFromDriver(d Driver, command string) (string, error) {
+	client, err := GetSSHClientFromDriver(d)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer f.Close()
 
-	// Use path.Join here, want to create unix path even when running on Windows.
-	cmdString := fmt.Sprintf("mkdir -p %q && cat > %q", authorizedKeysPath,
-		path.Join(authorizedKeysPath, "docker-host.json"))
-	cmd, err := d.GetSSHCommand(cmdString)
-	if err != nil {
-		return err
-	}
-	cmd.Stdin = f
-	return cmd.Run()
+	log.Debugf("About to run SSH command:\n%s", command)
+
+	output, err := client.Output(command)
+	log.Debugf("SSH cmd err, output: %v: %s", err, output)
+
+	return output, err
 }
 
-func PublicKeyExists() (bool, error) {
-	_, err := os.Stat(PublicKeyPath())
-	if err == nil {
-		return true, nil
-	} else if os.IsNotExist(err) {
-		return false, nil
+func sshAvailableFunc(d Driver) func() bool {
+	return func() bool {
+		log.Debug("Getting to WaitForSSH function...")
+		hostname, err := d.GetSSHHostname()
+		if err != nil {
+			log.Debugf("Error getting IP address waiting for SSH: %s", err)
+			return false
+		}
+		port, err := d.GetSSHPort()
+		if err != nil {
+			log.Debugf("Error getting SSH port: %s", err)
+			return false
+		}
+		if err := ssh.WaitForTCP(fmt.Sprintf("%s:%d", hostname, port)); err != nil {
+			log.Debugf("Error waiting for TCP waiting for SSH: %s", err)
+			return false
+		}
+
+		if _, err := RunSSHCommandFromDriver(d, "exit 0"); err != nil {
+			log.Debugf("Error getting ssh command 'exit 0' : %s", err)
+			return false
+		}
+		return true
 	}
-	return false, err
+}
+
+func WaitForSSH(d Driver) error {
+	if err := utils.WaitFor(sshAvailableFunc(d)); err != nil {
+		return fmt.Errorf("Too many retries.  Last error: %s", err)
+	}
+	return nil
 }

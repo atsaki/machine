@@ -1,6 +1,8 @@
 package servers
 
 import (
+	"reflect"
+
 	"github.com/mitchellh/mapstructure"
 	"github.com/rackspace/gophercloud"
 	"github.com/rackspace/gophercloud/pagination"
@@ -20,8 +22,21 @@ func (r serverResult) Extract() (*Server, error) {
 		Server Server `mapstructure:"server"`
 	}
 
-	err := mapstructure.Decode(r.Body, &response)
-	return &response.Server, err
+	config := &mapstructure.DecoderConfig{
+		DecodeHook: toMapFromString,
+		Result:     &response,
+	}
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return nil, err
+	}
+
+	err = decoder.Decode(r.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return &response.Server, nil
 }
 
 // CreateResult temporarily contains the response from a Create call.
@@ -124,6 +139,9 @@ type Server struct {
 	// AdminPass will generally be empty ("").  However, it will contain the administrative password chosen when provisioning a new server without a set AdminPass setting in the first place.
 	// Note that this is the ONLY time this field will be valid.
 	AdminPass string `json:"adminPass" mapstructure:"adminPass"`
+
+	// SecurityGroups includes the security groups that this instance has applied to it
+	SecurityGroups []map[string]interface{} `json:"security_groups" mapstructure:"security_groups"`
 }
 
 // ServerPage abstracts the raw results of making a List() request against the API.
@@ -164,7 +182,18 @@ func ExtractServers(page pagination.Page) ([]Server, error) {
 	var response struct {
 		Servers []Server `mapstructure:"servers"`
 	}
-	err := mapstructure.Decode(casted, &response)
+
+	config := &mapstructure.DecoderConfig{
+		DecodeHook: toMapFromString,
+		Result:     &response,
+	}
+	decoder, err := mapstructure.NewDecoder(config)
+	if err != nil {
+		return nil, err
+	}
+
+	err = decoder.Decode(casted)
+
 	return response.Servers, err
 }
 
@@ -234,4 +263,85 @@ func (r MetadatumResult) Extract() (map[string]string, error) {
 
 	err := mapstructure.Decode(r.Body, &response)
 	return response.Metadatum, err
+}
+
+func toMapFromString(from reflect.Kind, to reflect.Kind, data interface{}) (interface{}, error) {
+	if (from == reflect.String) && (to == reflect.Map) {
+		return map[string]interface{}{}, nil
+	}
+	return data, nil
+}
+
+// Address represents an IP address.
+type Address struct {
+	Version int    `mapstructure:"version"`
+	Address string `mapstructure:"addr"`
+}
+
+// AddressPage abstracts the raw results of making a ListAddresses() request against the API.
+// As OpenStack extensions may freely alter the response bodies of structures returned
+// to the client, you may only safely access the data provided through the ExtractAddresses call.
+type AddressPage struct {
+	pagination.SinglePageBase
+}
+
+// IsEmpty returns true if an AddressPage contains no networks.
+func (r AddressPage) IsEmpty() (bool, error) {
+	addresses, err := ExtractAddresses(r)
+	if err != nil {
+		return true, err
+	}
+	return len(addresses) == 0, nil
+}
+
+// ExtractAddresses interprets the results of a single page from a ListAddresses() call,
+// producing a map of addresses.
+func ExtractAddresses(page pagination.Page) (map[string][]Address, error) {
+	casted := page.(AddressPage).Body
+
+	var response struct {
+		Addresses map[string][]Address `mapstructure:"addresses"`
+	}
+
+	err := mapstructure.Decode(casted, &response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response.Addresses, err
+}
+
+// NetworkAddressPage abstracts the raw results of making a ListAddressesByNetwork() request against the API.
+// As OpenStack extensions may freely alter the response bodies of structures returned
+// to the client, you may only safely access the data provided through the ExtractAddresses call.
+type NetworkAddressPage struct {
+	pagination.SinglePageBase
+}
+
+// IsEmpty returns true if a NetworkAddressPage contains no addresses.
+func (r NetworkAddressPage) IsEmpty() (bool, error) {
+	addresses, err := ExtractNetworkAddresses(r)
+	if err != nil {
+		return true, err
+	}
+	return len(addresses) == 0, nil
+}
+
+// ExtractNetworkAddresses interprets the results of a single page from a ListAddressesByNetwork() call,
+// producing a slice of addresses.
+func ExtractNetworkAddresses(page pagination.Page) ([]Address, error) {
+	casted := page.(NetworkAddressPage).Body
+
+	var response map[string][]Address
+	err := mapstructure.Decode(casted, &response)
+	if err != nil {
+		return nil, err
+	}
+
+	var key string
+	for k := range response {
+		key = k
+	}
+
+	return response[key], err
 }

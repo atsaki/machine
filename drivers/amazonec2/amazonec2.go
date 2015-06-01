@@ -6,16 +6,19 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os/exec"
-	"path"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/codegangsta/cli"
 	"github.com/docker/machine/drivers"
 	"github.com/docker/machine/drivers/amazonec2/amz"
+	"github.com/docker/machine/log"
 	"github.com/docker/machine/ssh"
 	"github.com/docker/machine/state"
+	"github.com/docker/machine/utils"
 )
 
 const (
@@ -24,45 +27,49 @@ const (
 	defaultInstanceType      = "t2.micro"
 	defaultRootSize          = 16
 	ipRange                  = "0.0.0.0/0"
-	dockerConfigDir          = "/etc/docker"
 	machineSecurityGroupName = "docker-machine"
-	dockerPort               = 2376
+)
+
+var (
+	dockerPort = 2376
+	swarmPort  = 3376
 )
 
 type Driver struct {
-	Id                string
-	AccessKey         string
-	SecretKey         string
-	SessionToken      string
-	Region            string
-	AMI               string
-	SSHKeyID          int
-	KeyName           string
-	InstanceId        string
-	InstanceType      string
-	IPAddress         string
-	MachineName       string
-	SecurityGroupName string
-	SecurityGroupId   string
-	ReservationId     string
-	RootSize          int64
-	VpcId             string
-	SubnetId          string
-	Zone              string
-	CaCertPath        string
-	PrivateKeyPath    string
-	storePath         string
-	keyPath           string
-}
-
-type CreateFlags struct {
-	AccessKey    *string
-	SecretKey    *string
-	Region       *string
-	AMI          *string
-	InstanceType *string
-	SubnetId     *string
-	RootSize     *int64
+	Id                  string
+	AccessKey           string
+	SecretKey           string
+	SessionToken        string
+	Region              string
+	AMI                 string
+	SSHKeyID            int
+	SSHUser             string
+	SSHPort             int
+	KeyName             string
+	InstanceId          string
+	InstanceType        string
+	IPAddress           string
+	PrivateIPAddress    string
+	MachineName         string
+	SecurityGroupId     string
+	SecurityGroupName   string
+	ReservationId       string
+	RootSize            int64
+	IamInstanceProfile  string
+	VpcId               string
+	SubnetId            string
+	Zone                string
+	CaCertPath          string
+	PrivateKeyPath      string
+	SwarmMaster         bool
+	SwarmHost           string
+	SwarmDiscovery      string
+	storePath           string
+	keyPath             string
+	RequestSpotInstance bool
+	SpotPrice           string
+	PrivateIPOnly       bool
+	Monitoring          bool
 }
 
 func init() {
@@ -139,18 +146,60 @@ func GetCreateFlags() []cli.Flag {
 			Value:  defaultRootSize,
 			EnvVar: "AWS_ROOT_SIZE",
 		},
+		cli.StringFlag{
+			Name:   "amazonec2-iam-instance-profile",
+			Usage:  "AWS IAM Instance Profile",
+			EnvVar: "AWS_INSTANCE_PROFILE",
+		},
+		cli.StringFlag{
+			Name:   "amazonec2-ssh-user",
+			Usage:  "set the name of the ssh user",
+			Value:  "ubuntu",
+			EnvVar: "AWS_SSH_USER",
+		},
+		cli.BoolFlag{
+			Name:  "amazonec2-request-spot-instance",
+			Usage: "Set this flag to request spot instance",
+		},
+		cli.StringFlag{
+			Name:  "amazonec2-spot-price",
+			Usage: "AWS spot instance bid price (in dollar)",
+			Value: "0.50",
+		},
+		cli.BoolFlag{
+			Name:  "amazonec2-private-address-only",
+			Usage: "Only use a private IP address",
+		},
+		cli.BoolFlag{
+			Name:  "amazonec2-monitoring",
+			Usage: "Set this flag to enable CloudWatch monitoring",
+		},
 	}
 }
 
 func NewDriver(machineName string, storePath string, caCert string, privateKey string) (drivers.Driver, error) {
 	id := generateId()
-	return &Driver{Id: id, MachineName: machineName, storePath: storePath, CaCertPath: caCert, PrivateKeyPath: privateKey}, nil
+	return &Driver{
+		Id:             id,
+		MachineName:    machineName,
+		storePath:      storePath,
+		CaCertPath:     caCert,
+		PrivateKeyPath: privateKey,
+	}, nil
+}
+
+func (d *Driver) AuthorizePort(ports []*drivers.Port) error {
+	return nil
+}
+
+func (d *Driver) DeauthorizePort(ports []*drivers.Port) error {
+	return nil
 }
 
 func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	region, err := validateAwsRegion(flags.String("amazonec2-region"))
 	if err != nil {
-		return nil
+		return err
 	}
 
 	image := flags.String("amazonec2-ami")
@@ -163,6 +212,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SessionToken = flags.String("amazonec2-session-token")
 	d.Region = region
 	d.AMI = image
+	d.RequestSpotInstance = flags.Bool("amazonec2-request-spot-instance")
+	d.SpotPrice = flags.String("amazonec2-spot-price")
 	d.InstanceType = flags.String("amazonec2-instance-type")
 	d.VpcId = flags.String("amazonec2-vpc-id")
 	d.SubnetId = flags.String("amazonec2-subnet-id")
@@ -170,6 +221,14 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	zone := flags.String("amazonec2-zone")
 	d.Zone = zone[:]
 	d.RootSize = int64(flags.Int("amazonec2-root-size"))
+	d.IamInstanceProfile = flags.String("amazonec2-iam-instance-profile")
+	d.SwarmMaster = flags.Bool("swarm-master")
+	d.SwarmHost = flags.String("swarm-host")
+	d.SwarmDiscovery = flags.String("swarm-discovery")
+	d.SSHUser = flags.String("amazonec2-ssh-user")
+	d.SSHPort = 22
+	d.PrivateIPOnly = flags.Bool("amazonec2-private-address-only")
+	d.Monitoring = flags.Bool("amazonec2-monitoring")
 
 	if d.AccessKey == "" {
 		return fmt.Errorf("amazonec2 driver requires the --amazonec2-access-key option")
@@ -183,7 +242,26 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		return fmt.Errorf("amazonec2 driver requires either the --amazonec2-subnet-id or --amazonec2-vpc-id option")
 	}
 
+	if d.isSwarmMaster() {
+		u, err := url.Parse(d.SwarmHost)
+		if err != nil {
+			return fmt.Errorf("error parsing swarm host: %s", err)
+		}
+
+		parts := strings.Split(u.Host, ":")
+		port, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return err
+		}
+
+		swarmPort = port
+	}
+
 	return nil
+}
+
+func (d *Driver) GetMachineName() string {
+	return d.MachineName
 }
 
 func (d *Driver) DriverName() string {
@@ -200,11 +278,60 @@ func (d *Driver) checkPrereqs() error {
 	if key != nil {
 		return fmt.Errorf("There is already a keypair with the name %s.  Please either remove that keypair or use a different machine name.", d.MachineName)
 	}
+
+	regionZone := d.Region + d.Zone
+	if d.SubnetId == "" {
+		filters := []amz.Filter{
+			{
+				Name:  "availabilityZone",
+				Value: regionZone,
+			},
+			{
+				Name:  "vpc-id",
+				Value: d.VpcId,
+			},
+		}
+
+		subnets, err := d.getClient().GetSubnets(filters)
+		if err != nil {
+			return err
+		}
+
+		if len(subnets) == 0 {
+			return fmt.Errorf("unable to find a subnet in the zone: %s", regionZone)
+		}
+
+		d.SubnetId = subnets[0].SubnetId
+
+		// try to find default
+		if len(subnets) > 1 {
+			for _, subnet := range subnets {
+				if subnet.DefaultForAz {
+					d.SubnetId = subnet.SubnetId
+					break
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
 func (d *Driver) PreCreateCheck() error {
 	return d.checkPrereqs()
+}
+
+func (d *Driver) instanceIpAvailable() bool {
+	ip, err := d.GetIP()
+	if err != nil {
+		log.Debug(err)
+	}
+	if ip != "" {
+		d.IPAddress = ip
+		log.Debugf("Got the IP Address, it's %q", d.IPAddress)
+		return true
+	}
+	return false
 }
 
 func (d *Driver) Create() error {
@@ -229,84 +356,63 @@ func (d *Driver) Create() error {
 		VolumeType:          "gp2",
 	}
 
-	// get the subnet id
-	regionZone := d.Region + d.Zone
-	subnetId := d.SubnetId
-
-	if d.SubnetId == "" {
-		subnets, err := d.getClient().GetSubnets()
+	log.Debugf("launching instance in subnet %s", d.SubnetId)
+	var instance amz.EC2Instance
+	if d.RequestSpotInstance {
+		spotInstanceRequestId, err := d.getClient().RequestSpotInstances(d.AMI, d.InstanceType, d.Zone, 1, d.SecurityGroupId, d.KeyName, d.SubnetId, bdm, d.IamInstanceProfile, d.SpotPrice, d.Monitoring)
 		if err != nil {
-			return err
+			return fmt.Errorf("Error request spot instance: %s", err)
 		}
-
-		for _, s := range subnets {
-			if s.AvailabilityZone == regionZone {
-				subnetId = s.SubnetId
-				break
+		var instanceId string
+		var spotInstanceRequestStatus string
+		log.Info("Waiting for spot instance...")
+		// check until fulfilled
+		for instanceId == "" {
+			time.Sleep(time.Second * 5)
+			spotInstanceRequestStatus, instanceId, err = d.getClient().DescribeSpotInstanceRequests(spotInstanceRequestId)
+			if err != nil {
+				return fmt.Errorf("Error describe spot instance request: %s", err)
 			}
+			log.Debugf("spot instance request status: %s", spotInstanceRequestStatus)
 		}
-
-	}
-
-	if subnetId == "" {
-		return fmt.Errorf("unable to find a subnet in the zone: %s", regionZone)
-	}
-
-	log.Debugf("launching instance in subnet %s", subnetId)
-	instance, err := d.getClient().RunInstance(d.AMI, d.InstanceType, d.Zone, 1, 1, d.SecurityGroupId, d.KeyName, subnetId, bdm)
-
-	if err != nil {
-		return fmt.Errorf("Error launching instance: %s", err)
+		instance, err = d.getClient().GetInstance(instanceId)
+		if err != nil {
+			return fmt.Errorf("Error get instance: %s", err)
+		}
+	} else {
+		inst, err := d.getClient().RunInstance(d.AMI, d.InstanceType, d.Zone, 1, 1, d.SecurityGroupId, d.KeyName, d.SubnetId, bdm, d.IamInstanceProfile, d.PrivateIPOnly, d.Monitoring)
+		if err != nil {
+			return fmt.Errorf("Error launching instance: %s", err)
+		}
+		instance = inst
 	}
 
 	d.InstanceId = instance.InstanceId
 
-	d.waitForInstance()
-
-	log.Debugf("created instance ID %s, IP address %s",
-		d.InstanceId,
-		d.IPAddress)
-
-	log.Infof("Waiting for SSH on %s:%d", d.IPAddress, 22)
-
-	if err := ssh.WaitForTCP(fmt.Sprintf("%s:%d", d.IPAddress, 22)); err != nil {
+	log.Debug("waiting for ip address to become available")
+	if err := utils.WaitFor(d.instanceIpAvailable); err != nil {
 		return err
 	}
+
+	if len(instance.NetworkInterfaceSet) > 0 {
+		d.PrivateIPAddress = instance.NetworkInterfaceSet[0].PrivateIpAddress
+	}
+
+	d.waitForInstance()
+
+	log.Debugf("created instance ID %s, IP address %s, Private IP address %s",
+		d.InstanceId,
+		d.IPAddress,
+		d.PrivateIPAddress,
+	)
 
 	log.Debug("Settings tags for instance")
 	tags := map[string]string{
 		"Name": d.MachineName,
 	}
 
-	if err = d.getClient().CreateTags(d.InstanceId, tags); err != nil {
+	if err := d.getClient().CreateTags(d.InstanceId, tags); err != nil {
 		return err
-	}
-
-	log.Debugf("Setting hostname: %s", d.MachineName)
-	cmd, err := d.GetSSHCommand(fmt.Sprintf(
-		"echo \"127.0.0.1 %s\" | sudo tee -a /etc/hosts && sudo hostname %s && echo \"%s\" | sudo tee /etc/hostname",
-		d.MachineName,
-		d.MachineName,
-		d.MachineName,
-	))
-
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	log.Debugf("Installing Docker")
-
-	cmd, err = d.GetSSHCommand("if [ ! -e /usr/bin/docker ]; then curl -sL https://get.docker.com | sh -; fi")
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
 	}
 
 	return nil
@@ -328,8 +434,12 @@ func (d *Driver) GetIP() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	d.IPAddress = inst.IpAddress
-	return d.IPAddress, nil
+
+	if d.PrivateIPOnly {
+		return inst.PrivateIpAddress, nil
+	}
+
+	return inst.IpAddress, nil
 }
 
 func (d *Driver) GetState() (state.State, error) {
@@ -348,8 +458,31 @@ func (d *Driver) GetState() (state.State, error) {
 		return state.Stopping, nil
 	case "stopped":
 		return state.Stopped, nil
+	default:
+		return state.Error, nil
 	}
 	return state.None, nil
+}
+
+func (d *Driver) GetSSHHostname() (string, error) {
+	// TODO: use @nathanleclaire retry func here (ehazlett)
+	return d.GetIP()
+}
+
+func (d *Driver) GetSSHPort() (int, error) {
+	if d.SSHPort == 0 {
+		d.SSHPort = 22
+	}
+
+	return d.SSHPort, nil
+}
+
+func (d *Driver) GetSSHUsername() string {
+	if d.SSHUser == "" {
+		d.SSHUser = "ubuntu"
+	}
+
+	return d.SSHUser
 }
 
 func (d *Driver) Start() error {
@@ -361,9 +494,6 @@ func (d *Driver) Start() error {
 		return err
 	}
 
-	if err := d.updateDriver(); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -402,92 +532,13 @@ func (d *Driver) Kill() error {
 	return nil
 }
 
-func (d *Driver) StartDocker() error {
-	log.Debug("Starting Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker start")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) StopDocker() error {
-	log.Debug("Stopping Docker...")
-
-	cmd, err := d.GetSSHCommand("sudo service docker stop")
-	if err != nil {
-		return err
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) GetDockerConfigDir() string {
-	return dockerConfigDir
-}
-
-func (d *Driver) Upgrade() error {
-	log.Debugf("Upgrading Docker")
-
-	cmd, err := d.GetSSHCommand("sudo apt-get update && apt-get install --upgrade lxc-docker")
-	if err != nil {
-		return err
-
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-
-	}
-
-	return cmd.Run()
-}
-
-func (d *Driver) GetSSHCommand(args ...string) (*exec.Cmd, error) {
-	return ssh.GetSSHCommand(d.IPAddress, 22, "ubuntu", d.sshKeyPath(), args...), nil
-}
-
 func (d *Driver) getClient() *amz.EC2 {
 	auth := amz.GetAuth(d.AccessKey, d.SecretKey, d.SessionToken)
 	return amz.NewEC2(auth, d.Region)
 }
 
-func (d *Driver) sshKeyPath() string {
-	return path.Join(d.storePath, "id_rsa")
-}
-
-func (d *Driver) updateDriver() error {
-	inst, err := d.getInstance()
-	if err != nil {
-		return err
-	}
-	// wait for ipaddress
-	for {
-		i, err := d.getInstance()
-		if err != nil {
-			return err
-		}
-		if i.IpAddress == "" {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		d.InstanceId = inst.InstanceId
-		d.IPAddress = inst.IpAddress
-		break
-	}
-	return nil
-}
-
-func (d *Driver) publicSSHKeyPath() string {
-	return d.sshKeyPath() + ".pub"
+func (d *Driver) GetSSHKeyPath() string {
+	return filepath.Join(d.storePath, "id_rsa")
 }
 
 func (d *Driver) getInstance() (*amz.EC2Instance, error) {
@@ -499,19 +550,19 @@ func (d *Driver) getInstance() (*amz.EC2Instance, error) {
 	return &instance, nil
 }
 
-func (d *Driver) waitForInstance() error {
-	for {
-		st, err := d.GetState()
-		if err != nil {
-			return err
-		}
-		if st == state.Running {
-			break
-		}
-		time.Sleep(1 * time.Second)
+func (d *Driver) instanceIsRunning() bool {
+	st, err := d.GetState()
+	if err != nil {
+		log.Debug(err)
 	}
+	if st == state.Running {
+		return true
+	}
+	return false
+}
 
-	if err := d.updateDriver(); err != nil {
+func (d *Driver) waitForInstance() error {
+	if err := utils.WaitFor(d.instanceIsRunning); err != nil {
 		return err
 	}
 
@@ -520,11 +571,11 @@ func (d *Driver) waitForInstance() error {
 
 func (d *Driver) createKeyPair() error {
 
-	if err := ssh.GenerateSSHKey(d.sshKeyPath()); err != nil {
+	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
 	}
 
-	publicKey, err := ioutil.ReadFile(d.publicSSHKeyPath())
+	publicKey, err := ioutil.ReadFile(d.GetSSHKeyPath() + ".pub")
 	if err != nil {
 		return err
 	}
@@ -552,6 +603,21 @@ func (d *Driver) terminate() error {
 	}
 
 	return nil
+}
+
+func (d *Driver) isSwarmMaster() bool {
+	return d.SwarmMaster
+}
+
+func (d *Driver) securityGroupAvailableFunc(id string) func() bool {
+	return func() bool {
+		_, err := d.getClient().GetSecurityGroupById(id)
+		if err == nil {
+			return true
+		}
+		log.Debug(err)
+		return false
+	}
 }
 
 func (d *Driver) configureSecurityGroup(groupName string) error {
@@ -582,21 +648,14 @@ func (d *Driver) configureSecurityGroup(groupName string) error {
 		securityGroup = group
 		// wait until created (dat eventual consistency)
 		log.Debugf("waiting for group (%s) to become available", group.GroupId)
-		for {
-			_, err := d.getClient().GetSecurityGroupById(group.GroupId)
-			if err == nil {
-				break
-			}
-			log.Debug(err)
-			time.Sleep(1 * time.Second)
+		if err := utils.WaitFor(d.securityGroupAvailableFunc(group.GroupId)); err != nil {
+			return err
 		}
 	}
 
 	d.SecurityGroupId = securityGroup.GroupId
 
-	log.Debugf("configuring security group authorization for %s", ipRange)
-
-	perms := configureSecurityGroupPermissions(securityGroup)
+	perms := d.configureSecurityGroupPermissions(securityGroup)
 
 	if len(perms) != 0 {
 		log.Debugf("authorizing group %s with permissions: %v", securityGroup.GroupName, perms)
@@ -609,41 +668,51 @@ func (d *Driver) configureSecurityGroup(groupName string) error {
 	return nil
 }
 
-func configureSecurityGroupPermissions(group *amz.SecurityGroup) []amz.IpPermission {
+func (d *Driver) configureSecurityGroupPermissions(group *amz.SecurityGroup) []amz.IpPermission {
 	hasSshPort := false
 	hasDockerPort := false
+	hasSwarmPort := false
 	for _, p := range group.IpPermissions {
 		switch p.FromPort {
 		case 22:
 			hasSshPort = true
 		case dockerPort:
 			hasDockerPort = true
+		case swarmPort:
+			hasSwarmPort = true
 		}
 	}
 
 	perms := []amz.IpPermission{}
 
 	if !hasSshPort {
-		perm := amz.IpPermission{
+		perms = append(perms, amz.IpPermission{
 			IpProtocol: "tcp",
 			FromPort:   22,
 			ToPort:     22,
 			IpRange:    ipRange,
-		}
-
-		perms = append(perms, perm)
+		})
 	}
 
 	if !hasDockerPort {
-		perm := amz.IpPermission{
+		perms = append(perms, amz.IpPermission{
 			IpProtocol: "tcp",
 			FromPort:   dockerPort,
 			ToPort:     dockerPort,
 			IpRange:    ipRange,
-		}
-
-		perms = append(perms, perm)
+		})
 	}
+
+	if !hasSwarmPort && d.SwarmMaster {
+		perms = append(perms, amz.IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   swarmPort,
+			ToPort:     swarmPort,
+			IpRange:    ipRange,
+		})
+	}
+
+	log.Debugf("configuring security group authorization for %s", ipRange)
 
 	return perms
 }

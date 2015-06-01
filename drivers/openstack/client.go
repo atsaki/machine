@@ -1,7 +1,12 @@
 package openstack
 
 import (
-	log "github.com/Sirupsen/logrus"
+	"crypto/tls"
+	"fmt"
+	"net/http"
+
+	"github.com/docker/machine/log"
+	"github.com/docker/machine/version"
 	"github.com/rackspace/gophercloud"
 	"github.com/rackspace/gophercloud/openstack"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
@@ -60,9 +65,7 @@ func (c *GenericClient) CreateInstance(d *Driver) (string, error) {
 		}
 	}
 
-	log.WithFields(log.Fields{
-		"Name": d.MachineName,
-	}).Info("Creating server...")
+	log.Info("Creating machine...")
 
 	server, err := servers.Create(c.Compute, keypairs.CreateOptsExt{
 		serverOpts,
@@ -395,6 +398,9 @@ func (c *GenericClient) Authenticate(d *Driver) error {
 
 	log.WithFields(log.Fields{
 		"AuthUrl":    d.AuthUrl,
+		"Insecure":   d.Insecure,
+		"DomainID":   d.DomainID,
+		"DomainName": d.DomainName,
 		"Username":   d.Username,
 		"TenantName": d.TenantName,
 		"TenantID":   d.TenantId,
@@ -402,6 +408,8 @@ func (c *GenericClient) Authenticate(d *Driver) error {
 
 	opts := gophercloud.AuthOptions{
 		IdentityEndpoint: d.AuthUrl,
+		DomainID:         d.DomainID,
+		DomainName:       d.DomainName,
 		Username:         d.Username,
 		Password:         d.Password,
 		TenantName:       d.TenantName,
@@ -409,10 +417,25 @@ func (c *GenericClient) Authenticate(d *Driver) error {
 		AllowReauth:      true,
 	}
 
-	provider, err := openstack.AuthenticatedClient(opts)
+	provider, err := openstack.NewClient(opts.IdentityEndpoint)
 	if err != nil {
 		return err
 	}
+
+	provider.UserAgent.Prepend(fmt.Sprintf("docker-machine/v%s", version.VERSION))
+
+	if d.Insecure {
+		// Configure custom TLS settings.
+		config := &tls.Config{InsecureSkipVerify: true}
+		transport := &http.Transport{TLSClientConfig: config}
+		provider.HTTPClient.Transport = transport
+	}
+
+	err = openstack.Authenticate(provider, opts)
+	if err != nil {
+		return err
+	}
+
 	c.Provider = provider
 
 	return nil

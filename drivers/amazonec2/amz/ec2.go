@@ -8,9 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 
-	"github.com/docker/machine/state"
 	awsauth "github.com/smartystreets/go-aws-auth"
 )
 
@@ -105,6 +103,14 @@ type (
 		OwnerId       string        `xml:"ownerId"`
 		Instances     []EC2Instance `xml:"instancesSet>item"`
 	}
+
+	RequestSpotInstancesResponse struct {
+		RequestId              string `xml:"requestId"`
+		SpotInstanceRequestSet []struct {
+			SpotInstanceRequestId string `xml:"spotInstanceRequestId"`
+			State                 string `xml:"state"`
+		} `xml:"spotInstanceRequestSet>item"`
+	}
 )
 
 func newAwsApiResponseError(r http.Response) error {
@@ -160,13 +166,14 @@ func (e *EC2) awsApiCall(v url.Values) (*http.Response, error) {
 		fmt.Printf("client encountered error while doing the request: %s", err.Error())
 		return resp, fmt.Errorf("client encountered error while doing the request: %s", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		return resp, newAwsApiResponseError(*resp)
 	}
 	return resp, nil
 }
 
-func (e *EC2) RunInstance(amiId string, instanceType string, zone string, minCount int, maxCount int, securityGroup string, keyName string, subnetId string, bdm *BlockDeviceMapping) (EC2Instance, error) {
+func (e *EC2) RunInstance(amiId string, instanceType string, zone string, minCount int, maxCount int, securityGroup string, keyName string, subnetId string, bdm *BlockDeviceMapping, role string, privateIPOnly bool, monitoring bool) (EC2Instance, error) {
 	instance := Instance{}
 	v := url.Values{}
 	v.Set("Action", "RunInstances")
@@ -179,7 +186,20 @@ func (e *EC2) RunInstance(amiId string, instanceType string, zone string, minCou
 	v.Set("NetworkInterface.0.DeviceIndex", "0")
 	v.Set("NetworkInterface.0.SecurityGroupId.0", securityGroup)
 	v.Set("NetworkInterface.0.SubnetId", subnetId)
-	v.Set("NetworkInterface.0.AssociatePublicIpAddress", "1")
+	if privateIPOnly {
+		v.Set("NetworkInterface.0.AssociatePublicIpAddress", "0")
+	} else {
+		v.Set("NetworkInterface.0.AssociatePublicIpAddress", "1")
+	}
+	if monitoring {
+		v.Set("Monitoring.Enabled", "1")
+	} else {
+		v.Set("Monitoring.Enabled", "0")
+	}
+
+	if len(role) > 0 {
+		v.Set("IamInstanceProfile.Name", role)
+	}
 
 	if bdm != nil {
 		v.Set("BlockDeviceMapping.0.DeviceName", bdm.DeviceName)
@@ -212,6 +232,86 @@ func (e *EC2) RunInstance(amiId string, instanceType string, zone string, minCou
 
 	instance.info = unmarshalledResponse.Instances[0]
 	return instance.info, nil
+}
+
+func (e *EC2) RequestSpotInstances(amiId string, instanceType string, zone string, instanceCount int, securityGroup string, keyName string, subnetId string, bdm *BlockDeviceMapping, role string, spotPrice string, monitoring bool) (string, error) {
+	v := url.Values{}
+	v.Set("Action", "RequestSpotInstances")
+	v.Set("LaunchSpecification.ImageId", amiId)
+	v.Set("LaunchSpecification.Placement.AvailabilityZone", e.Region+zone)
+	v.Set("InstanceCount", strconv.Itoa(instanceCount))
+	v.Set("SpotPrice", spotPrice)
+	v.Set("LaunchSpecification.KeyName", keyName)
+	v.Set("LaunchSpecification.InstanceType", instanceType)
+	v.Set("LaunchSpecification.NetworkInterface.0.DeviceIndex", "0")
+	v.Set("LaunchSpecification.NetworkInterface.0.SecurityGroupId.0", securityGroup)
+	v.Set("LaunchSpecification.NetworkInterface.0.SubnetId", subnetId)
+	v.Set("LaunchSpecification.NetworkInterface.0.AssociatePublicIpAddress", "1")
+	if monitoring {
+		v.Set("LaunchSpecification.Monitoring.Enabled", "1")
+	} else {
+		v.Set("LaunchSpecification.Monitoring.Enabled", "0")
+	}
+
+	if len(role) > 0 {
+		v.Set("LaunchSpecification.IamInstanceProfile.Name", role)
+	}
+
+	if bdm != nil {
+		v.Set("LaunchSpecification.BlockDeviceMapping.0.DeviceName", bdm.DeviceName)
+		v.Set("LaunchSpecification.BlockDeviceMapping.0.VirtualName", bdm.VirtualName)
+		v.Set("LaunchSpecification.BlockDeviceMapping.0.Ebs.VolumeSize", strconv.FormatInt(bdm.VolumeSize, 10))
+		v.Set("LaunchSpecification.BlockDeviceMapping.0.Ebs.VolumeType", bdm.VolumeType)
+		deleteOnTerm := 0
+		if bdm.DeleteOnTermination {
+			deleteOnTerm = 1
+		}
+		v.Set("LaunchSpecification.BlockDeviceMapping.0.Ebs.DeleteOnTermination", strconv.Itoa(deleteOnTerm))
+	}
+
+	resp, err := e.awsApiCall(v)
+
+	if err != nil {
+		return "", newAwsApiCallError(err)
+	}
+	defer resp.Body.Close()
+	contents, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("Error reading AWS response body")
+	}
+	unmarshalledResponse := RequestSpotInstancesResponse{}
+	err = xml.Unmarshal(contents, &unmarshalledResponse)
+	if err != nil {
+		return "", fmt.Errorf("Error unmarshalling AWS response XML: %s", err)
+	}
+	return unmarshalledResponse.SpotInstanceRequestSet[0].SpotInstanceRequestId, nil
+}
+
+func (e *EC2) DescribeSpotInstanceRequests(spotInstanceRequestId string) (string, string, error) {
+	v := url.Values{}
+	v.Set("Action", "DescribeSpotInstanceRequests")
+	v.Set("SpotInstanceRequestId.0", spotInstanceRequestId)
+
+	resp, err := e.awsApiCall(v)
+
+	if err != nil {
+		return "", "", newAwsApiCallError(err)
+	}
+	defer resp.Body.Close()
+
+	contents, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("Error reading AWS response body")
+	}
+	unmarshalledResponse := DescribeSpotInstanceRequestsResponse{}
+	err = xml.Unmarshal(contents, &unmarshalledResponse)
+	if err != nil {
+		return "", "", fmt.Errorf("Error unmarshalling AWS response XML: %s", err)
+	}
+	if code := unmarshalledResponse.SpotInstanceRequestSet[0].Status.Code; code != "fulfilled" {
+		return code, "", nil
+	}
+	return "fulfilled", unmarshalledResponse.SpotInstanceRequestSet[0].InstanceId, nil
 }
 
 func (e *EC2) DeleteKeyPair(name string) error {
@@ -417,13 +517,20 @@ func (e *EC2) GetSecurityGroupById(id string) (*SecurityGroup, error) {
 	return nil, nil
 }
 
-func (e *EC2) GetSubnets() ([]Subnet, error) {
+func (e *EC2) GetSubnets(filters []Filter) ([]Subnet, error) {
 	subnets := []Subnet{}
-	resp, err := e.performStandardAction("DescribeSubnets")
-	if err != nil {
-		return subnets, err
+	v := url.Values{}
+	v.Set("Action", "DescribeSubnets")
+
+	for idx, filter := range filters {
+		n := idx + 1 // amazon starts counting from 1 not 0
+		v.Set(fmt.Sprintf("Filter.%d.Name", n), filter.Name)
+		v.Set(fmt.Sprintf("Filter.%d.Value", n), filter.Value)
 	}
+
+	resp, err := e.awsApiCall(v)
 	defer resp.Body.Close()
+
 	contents, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return subnets, fmt.Errorf("Error reading AWS response body: %s", err)
@@ -475,40 +582,6 @@ func (e *EC2) GetKeyPair(name string) (*KeyPair, error) {
 	return nil, nil
 }
 
-func (e *EC2) GetInstanceState(instanceId string) (state.State, error) {
-	resp, err := e.performInstanceAction(instanceId, "DescribeInstances", nil)
-	if err != nil {
-		return state.Error, err
-	}
-	defer resp.Body.Close()
-	contents, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return state.Error, fmt.Errorf("Error reading AWS response body: %s", err)
-	}
-
-	unmarshalledResponse := DescribeInstancesResponse{}
-	if err = xml.Unmarshal(contents, &unmarshalledResponse); err != nil {
-		return state.Error, fmt.Errorf("Error unmarshalling AWS response XML: %s", err)
-	}
-
-	reservationSet := unmarshalledResponse.ReservationSet[0]
-	instanceState := reservationSet.InstancesSet[0].InstanceState
-
-	shortState := strings.TrimSpace(instanceState.Name)
-	switch shortState {
-	case "pending":
-		return state.Starting, nil
-	case "running":
-		return state.Running, nil
-	case "stopped":
-		return state.Stopped, nil
-	case "stopping":
-		return state.Stopped, nil
-	}
-
-	return state.Error, nil
-}
-
 func (e *EC2) GetInstance(instanceId string) (EC2Instance, error) {
 	ec2Instance := EC2Instance{}
 	resp, err := e.performInstanceAction(instanceId, "DescribeInstances", nil)
@@ -526,9 +599,11 @@ func (e *EC2) GetInstance(instanceId string) (EC2Instance, error) {
 		return ec2Instance, fmt.Errorf("Error unmarshalling AWS response XML: %s", err)
 	}
 
-	reservationSet := unmarshalledResponse.ReservationSet[0]
-	instance := reservationSet.InstancesSet[0]
-	return instance, nil
+	if len(unmarshalledResponse.ReservationSet) > 0 {
+		reservationSet := unmarshalledResponse.ReservationSet[0]
+		ec2Instance = reservationSet.InstancesSet[0]
+	}
+	return ec2Instance, nil
 }
 
 func (e *EC2) StartInstance(instanceId string) error {
