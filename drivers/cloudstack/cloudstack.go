@@ -592,8 +592,8 @@ func (d *Driver) createPortForwardingRules() error {
 		public, private int
 	}
 	ports := []pair{
-		pair{public: dockerPort, private: dockerPort},
-		pair{public: d.SSHPort, private: 22},
+		{public: dockerPort, private: dockerPort},
+		{public: d.SSHPort, private: 22},
 	}
 	if d.SwarmMaster {
 		ports = append(ports, pair{public: swarmPort, private: swarmPort})
